@@ -1,0 +1,404 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.010;
+use utf8;
+
+use Getopt::Long;
+use YAML::Syck;
+use Path::Class;
+use URI;
+use Pod::Usage;
+use WWW::Mechanize;
+use XML::Atom::Feed;
+use HTML::TreeBuilder::XPath;
+use HTML::Selector::XPath 'selector_to_xpath';
+use Encode;
+
+binmode STDOUT, ':utf8';
+binmode STDERR, ':utf8';
+
+GetOptions(\my %opt, qw{
+    home=s
+    project=s
+    account=s
+    password=s
+    --help
+});
+
+my $USAGE  = <<__USAGE__;
+    \$ perl /this/tool [command] [options]
+__USAGE__
+
+my $CONFIG = <<__CONFIG__;
+    format=yaml
+    name=.redmine
+
+    home:     http://redmine.example.com/home/ 
+    project:  project-name
+    account:  your account
+    password: your password (optional)
+__CONFIG__
+
+my $commans = {
+    'touch' => sub {
+        my ($config) = shift;
+
+        my $res = mech($config)->get( project_url($config)."/repository");
+
+        if ($res->code eq '200') {
+            say "success";
+        } else {
+            say "Error: " . $res->status_line;
+        }
+    },
+    'fix' => sub {
+        my ($config) = shift;
+
+        my $issue = $ARGV[0];
+
+        die "issue is not set" unless $issue;
+
+        my $m = mech($config);
+
+        my $res = $m->get($config->{home}."issues/$issue/edit");
+
+        if ($res->code ne '200') {
+            die "not found issue:$issue";
+        }
+
+        my $pres = $m->submit_form(
+            form_id     => 'issue-form',
+            with_fields => {
+                'issue[status_id]'  => 3,
+                'issue[done_ratio]' => 100,
+            }
+        );
+
+        if ($pres->code eq '200') {
+            say "success";
+        } else {
+            say "Error: " . $res->status_line;
+        }
+    },
+    'ratio' => sub {
+        my ($config) = shift;
+        my $issue = $ARGV[0];
+        my $ratio = $ARGV[1];
+
+        die "issue is not set" unless $issue;
+        die "ratio is not set" unless $ratio;
+
+        my $m = mech($config);
+
+        my $res = $m->get($config->{home}."issues/$issue/edit");
+
+        if ($res->code ne '200') {
+            die "not found issue:$issue";
+        }
+
+        my $pres = $m->submit_form(
+            form_id     => 'issue-form',
+            with_fields => {
+                'issue[status_id]'  => 2,
+                'issue[done_ratio]' => $ratio,
+            }
+        );
+
+        if ($pres->code eq '200') {
+            say "success";
+        } else {
+            say "Error: " . $res->status_line;
+        }
+    },
+    'myissues' => sub {
+        my ($config) = shift;
+
+        my $m = mech($config);
+        $m->get(project_url($config)."/issues?assigned_to_id=me&per_page=100&set_filter=1&sort=due_date");
+        my $tree = HTML::TreeBuilder::XPath->new_from_content($m->content);
+
+        my @issues;
+        for ($tree->findnodes(selector_to_xpath('table.issues tbody tr.issue'))) {
+
+            my $issue = {};
+            for my $elm ($_->look_down(_tag => 'td') ) {
+                my $name = $elm->attr('class');
+                my $value = $elm->as_text;
+                $issue->{$name} = ($name eq 'id') ? "#$value" : $value;
+            }
+            push @issues, $issue;
+        }
+
+        show_table(
+            [qw/id subject assigned_to status due_date/],
+            \@issues,
+            " | "
+        );
+    },
+
+    'issues' => sub {
+        my ($config) = shift;
+
+        my $m = mech($config);
+        $m->get(project_url($config)."/issues?per_page=100&set_filter=1&sort=due_date");
+        my $tree = HTML::TreeBuilder::XPath->new_from_content($m->content);
+
+        my @issues;
+        for ($tree->findnodes(selector_to_xpath('table.issues tbody tr.issue'))) {
+
+            my $issue = {};
+            for my $elm ($_->look_down(_tag => 'td') ) {
+                my $name = $elm->attr('class');
+                my $value = $elm->as_text;
+                $issue->{$name} = ($name eq 'id') ? "#$value" : $value;
+            }
+            push @issues, $issue;
+        }
+
+        show_table(
+            [qw/id subject assigned_to status due_date/],
+            \@issues,
+            " | "
+        );
+    },
+};
+
+if ($opt{help}) {
+    my $COMMANDS = "";
+    $COMMANDS .= "    $_\n" for keys(%$commans);
+    print qq{
+Usage:
+$USAGE
+
+Commans:
+$COMMANDS
+
+Options and Configs:
+$CONFIG
+
+more information see source code.
+};
+    exit;
+}
+
+# main
+{
+    my $command = shift || "touch";
+
+    my $config = { %{ get_config() }, %opt };
+
+    
+    die "config home nothing" unless $config->{home};
+    die "config account nothing" unless $config->{account};
+    die "config project nothing" unless $config->{project};
+    
+    if (substr($config->{home}, -1) ne "/") {
+        $config->{home} .= "/";
+    }
+
+    $config->{password} ||= get_password($config);
+    
+    die "not found password" unless $config->{password};
+    
+    unless ($commans->{$command}) {
+        die "not found command `$command`.";
+    }
+    
+    $commans->{$command}->($config);
+}
+
+sub mech {
+    my $config = shift;
+    state $mech ||= do {
+        my $m = WWW::Mechanize->new;
+        $m->credentials($config->{account}, $config->{password});
+        return $m;
+    };
+    $mech;
+}
+
+sub project_url {
+    my $config = shift;
+
+    return $config->{home}."projects/".$config->{project};
+}
+
+sub get_password {
+    my $config = shift;
+
+    my ($cmd, $ret);
+
+    my $security = c("which security");
+    
+    unless ($security) {
+        die "not found command `security`\n";
+    }
+
+    my $opt = get_keychain_option($config);
+
+    $cmd = join " ", $security, "find-internet-password", %$opt, "-g";
+
+    $ret = `$cmd 2>&1`;
+
+    if ($ret =~ m/password: "(.*?)"/) {
+        return $1;
+    }
+
+    say "Not found password in keychain.";
+
+    while (1) {
+        say "Do you set password for ".$opt->{'-s'}."(".$opt->{'-a'}.") now ? [y/n]";
+        my $ans = <>;
+        chomp $ans;
+        if ($ans eq 'y') {
+            last;
+        } elsif ($ans eq 'n') {
+            return;
+        }
+    }
+    
+    my ($password, $confirm);
+    my $misscount = 0;
+    system("stty -echo");
+    while (1) {
+        print "Enter your password: ";
+        chomp($password = <>);
+        print "\n";
+
+        print "Enter same password again: ";
+        chomp($confirm = <>);
+        print "\n";
+
+        if (0 < length $password && $password eq $confirm) {
+            last;
+        } elsif (3 < ++$misscount) {
+            say "not match pasward. see you.";
+            return;
+        } else {
+            say "please try again.";
+        }
+    }
+    system("stty echo");
+    
+    $cmd = join " ", $security, "add-internet-password", %$opt, "-w", $password;
+    $ret = `$cmd 2>&1`;
+
+    return $password;
+}
+
+sub get_keychain_option {
+    my $config = shift;
+    my $home = URI->new($config->{home});
+    
+    return {
+        -s => $home->host,
+        -p => $home->path,
+        -P => $home->port,
+        -r => ($home->scheme eq 'https') ? "htps" : $home->schem,
+        -a => $config->{account},
+    };
+}
+
+sub get_config {
+    my $dir = dir(c("pwd"));
+    my $config = {};
+    while ($dir ne "/") {
+        $config = { %{get_config_in_dir($dir)}, %$config };
+        $dir = $dir->parent;
+    }
+    return {
+        %{get_config_in_dir(dir($ENV{HOME}))},
+        %$config
+    };
+}
+
+sub get_config_in_dir {
+    my $dir = shift;
+    if (-f $dir->file(".redmine")) {
+        return YAML::Syck::LoadFile($dir->file(".redmine"));
+    }
+    return {};
+}
+
+sub c {
+    my $r = `$_[0]`;
+    chomp $r;
+    $r;
+}
+
+sub show_table {
+    my ($fields, $rows, $separator) = @_;
+    
+    my %len;
+    $len{$_} = visual_length($_) for @$fields;
+    for my $row (@$rows) {
+        for my $f (@$fields) {
+            my $l = visual_length($row->{$f});
+            $len{$f} = $l if $len{$f} < $l;
+        }
+    }
+
+    for my $field (@$fields) {
+        print $separator;
+        print $field;
+        print white_space($len{$field} - visual_length($field));
+    }
+    print "$separator\n";
+
+    for my $field (@$fields) {
+        print $separator;
+        print white_space($len{$field}, "-");
+    }
+    print "$separator\n";
+
+    for my $row (@$rows) {
+        for my $f (@$fields) {
+            print $separator;
+            print $row->{$f};
+            print white_space($len{$f} - visual_length($row->{$f}));
+        }
+        print "$separator\n";
+    }
+}
+
+sub visual_length {
+    return 0 unless @_;
+    length(encode('cp932',$_[0]));
+}
+
+sub white_space {
+    my $len = shift || 0;
+    my $s = shift || " ";
+    my $space = "";
+    for (0..$len) {
+        $space .= $s;
+    }
+    $space;
+}
+
+__END__
+
+=head1 SYNOPSIS
+
+$ perl /this/tool [command] [options]
+
+=head2 Options
+
+    home:     http://redmine.example.com/home/ 
+    project:  project-name
+    account:  your account
+    password: your password (optional)
+    help:     show help
+
+=head2 Config file 
+
+    format=yaml
+    name=.redmine
+
+    home:     http://redmine.example.com/home/ 
+    project:  project-name
+    account:  your account
+    password: your password (optional)
+
+    
